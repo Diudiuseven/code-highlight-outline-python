@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import re
 
+from app.coverage import cover
 from app.models import (
     AnalysisResult,
     Diagnostic,
@@ -26,6 +27,19 @@ from app.models import (
 _NUMBER_RE = re.compile(r"-?\d+(\.\d+)?([eE][+-]?\d+)?")
 _LITERALS = {"true", "false", "null", "Infinity", "NaN", "-Infinity"}
 _PUNCT = "{}[]:,"
+
+
+class RawLiteral(str):
+    """A number/constant literal captured verbatim from the source.
+
+    It subclasses ``str`` (its text is the original spelling) but is *not* a
+    document string: the renderer emits it without quotes. This is what
+    keeps the textual form of numbers (``1e3`` vs ``1000.0``) and keeps a
+    genuine JSON string ``"1e3"`` a string -- such a value parses to a
+    plain ``str``, not to ``RawLiteral``.
+    """
+
+    __slots__ = ()
 
 
 class _Object(list):
@@ -44,7 +58,8 @@ class JsonPlugin:
     # -------------------------------------------------- plugin interface
     def analyze(self, source: str) -> AnalysisResult:
         diagnostics: list[Diagnostic] = []
-        highlights, _keys = self._scan(source, diagnostics, line_offset=0)
+        tokens, _keys = self._scan(source, diagnostics, line_offset=0)
+        highlights = cover(source, tokens)
         return self.rederive(source, highlights, extra_diagnostics=diagnostics)
 
     def tokenize_region(self, snippet: str, line_offset: int) -> list[Highlight] | None:
@@ -52,10 +67,10 @@ class JsonPlugin:
         so a region aligned to line boundaries scans cleanly; any lexical
         error inside the region forces a full-recompute fallback (None)."""
         diagnostics: list[Diagnostic] = []
-        highlights, _keys = self._scan(snippet, diagnostics, line_offset)
+        tokens, _keys = self._scan(snippet, diagnostics, line_offset)
         if diagnostics:
             return None
-        return highlights
+        return cover(snippet, tokens, line_offset=line_offset)
 
     def lexical(self, highlights: list[Highlight]) -> list[Highlight]:
         return highlights  # all JSON categories are lexical
@@ -187,13 +202,16 @@ class JsonPlugin:
 
     # --------------------------------------------------------------- parser
     def _parse(self, source: str, diagnostics: list[Diagnostic]):
+        def raw(text: str) -> RawLiteral:
+            return RawLiteral(text)
+
         try:
             return json.loads(
                 source,
                 object_pairs_hook=_Object,
-                parse_int=str,
-                parse_float=str,
-                parse_constant=str,
+                parse_int=raw,
+                parse_float=raw,
+                parse_constant=raw,
             )
         except json.JSONDecodeError as exc:
             diagnostics.append(
@@ -269,11 +287,14 @@ class JsonPlugin:
                 return "[]"
             items = [f"{child_pad}{self._render(v, depth + 1)}" for v in value]
             return "[\n" + ",\n".join(items) + "\n" + pad + "]"
+        # A raw literal (number / true / false / null / Infinity / NaN) is
+        # emitted in its original textual form, unquoted.
+        if isinstance(value, RawLiteral):
+            return str(value)
+        # Every other str is a genuine document string and MUST stay a
+        # string, even when its content looks like a number or a literal
+        # ("123", "true", "null", "1e3", ...).
         if isinstance(value, str):
-            # numbers/constants were captured raw by parse_int/parse_float;
-            # real strings are re-emitted in canonical escaped form
-            if value in _LITERALS or _NUMBER_RE.fullmatch(value):
-                return value
             return json.dumps(value, ensure_ascii=False)
         if value is True:
             return "true"

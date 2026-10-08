@@ -11,6 +11,7 @@ import io
 import keyword
 import tokenize
 
+from app.coverage import cover
 from app.models import (
     AnalysisResult,
     Diagnostic,
@@ -28,11 +29,19 @@ _DECL_CATEGORIES = {
     ast.ClassDef: "class.declaration",
 }
 
+# Python 3.12+ splits f-strings into these token types; their spans are real
+# lexical text and must be highlighted like an ordinary string literal.
+_FSTRING_TYPES = frozenset(
+    getattr(tokenize, name)
+    for name in ("FSTRING_START", "FSTRING_MIDDLE", "FSTRING_END")
+    if hasattr(tokenize, name)
+)
+
 
 def _category_of(tok: tokenize.TokenInfo) -> str | None:
     if tok.type == tokenize.COMMENT:
         return "comment"
-    if tok.type == tokenize.STRING:
+    if tok.type == tokenize.STRING or tok.type in _FSTRING_TYPES:
         return "string"
     if tok.type == tokenize.NUMBER:
         return "number"
@@ -98,7 +107,7 @@ class PythonPlugin:
                 out.append(Highlight(Range(st, en), cat))
         except (tokenize.TokenError, IndentationError, SyntaxError):
             return None
-        return out
+        return cover(snippet, out, line_offset=line_offset)
 
     def lexical(self, highlights: list[Highlight]) -> list[Highlight]:
         return [
@@ -154,7 +163,7 @@ class PythonPlugin:
         except (tokenize.TokenError, IndentationError, SyntaxError) as exc:
             ok = False
             diagnostics.append(_diag_from_exc(exc))
-        highlights.sort(key=lambda h: (h.range.start, h.range.end))
+        highlights = cover(source, highlights)
         return highlights, protected, ok
 
     @staticmethod

@@ -31,6 +31,34 @@ def make_service(**cfg):
     return CodeService(ServiceConfig(**cfg), default_registry())
 
 
+def slice_range(source: str, rng):
+    """Exact source substring covered by a (line, col) half-open range."""
+    lines = source.split("\n")
+    if rng.start.line == rng.end.line:
+        return lines[rng.start.line][rng.start.col : rng.end.col]
+    parts = [lines[rng.start.line][rng.start.col :]]
+    parts.extend(lines[rng.start.line + 1 : rng.end.line])
+    parts.append(lines[rng.end.line][: rng.end.col])
+    return "\n".join(parts)
+
+
+def reconstruct(source: str, highlights) -> str:
+    """Concatenate highlighted slices in range order."""
+    return "".join(slice_range(source, h.range) for h in highlights)
+
+
+def assert_partitions(source: str, highlights) -> None:
+    """Highlights must be sorted, non-overlapping, gap-free and reconstruct."""
+    ordered = sorted(highlights, key=lambda h: (h.range.start, h.range.end))
+    prev = None
+    for h in ordered:
+        assert h.range.start < h.range.end, "empty highlight"
+        if prev is not None:
+            assert prev.range.end <= h.range.start, "overlapping highlights"
+        prev = h
+    assert reconstruct(source, ordered) == source, "highlights must cover source exactly"
+
+
 PY_SAMPLE = '''import os
 from typing import List
 

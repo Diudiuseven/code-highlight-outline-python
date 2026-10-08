@@ -88,7 +88,13 @@ def create_app(
 
     @app.get("/languages")
     async def languages():
-        return {"languages": service._registry.names()}
+        enabled = service._config.languages
+        if enabled is None:
+            names = service._registry.names()
+        else:
+            # only registered AND enabled languages are usable
+            names = sorted(n for n in service._registry.names() if n in enabled)
+        return {"languages": names}
 
     @app.get("/config")
     async def get_config():

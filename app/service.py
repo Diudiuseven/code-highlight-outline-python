@@ -145,16 +145,24 @@ class CodeService:
             self._inflight[key] = task
             self.compute_count += 1
 
-            def _cleanup(_t: asyncio.Task, k: tuple[str, str] = key) -> None:
+            def _settle(
+                done: asyncio.Task, k: tuple[str, str] = key
+            ) -> None:
                 self._inflight.pop(k, None)
+                # Populate the cache from the shared task itself, not from a
+                # particular waiter, so a single cancellation/timeout can
+                # neither drop a clean result nor cache a degraded one.
+                if not done.cancelled():
+                    exc = done.exception()
+                    if exc is None:
+                        res = done.result()
+                        if not res.degraded:
+                            self._cache_put(k, res)
 
-            task.add_done_callback(_cleanup)
+            task.add_done_callback(_settle)
         # shield: one caller's cancellation must not cancel the shared
         # computation nor prevent others from receiving the result
-        result = await asyncio.shield(task)
-        if not any(d.code == "timeout" for d in result.diagnostics):
-            self._cache_put(key, result)
-        return result
+        return await asyncio.shield(task)
 
     async def apply_edit(
         self, language: str, old: bytes, edit: TextEdit, new: bytes
@@ -162,9 +170,10 @@ class CodeService:
         plugin = self._plugin(language)
         old_text, _ = _decode(old)
         new_text, new_diags = _decode(new)
-        affected = affected_range(old_text, edit, new_text)
 
         old_result = await self.analyze(language, old)
+        old_lex = plugin.lexical(old_result.highlights)
+        affected = affected_range(old_text, edit, new_text, old_lex)
         if new_diags:
             result = await self.analyze(language, new)
             return IncrementalResult(result=result, affected=affected)
@@ -196,5 +205,8 @@ class CodeService:
             )
             return IncrementalResult(result=result, affected=affected)
         key = (language, hashlib.sha256(new).hexdigest())
-        self._cache_put(key, result)
+        if not result.degraded:
+            # degraded (incl. syntax-error / invalid-encoding / timeout)
+            # results are never written to the cache
+            self._cache_put(key, result)
         return IncrementalResult(result=result, affected=affected)
