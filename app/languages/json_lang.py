@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import re
 
+from app.languages.tiling import tile_highlights
 from app.models import (
     AnalysisResult,
     Diagnostic,
@@ -26,6 +27,15 @@ from app.models import (
 _NUMBER_RE = re.compile(r"-?\d+(\.\d+)?([eE][+-]?\d+)?")
 _LITERALS = {"true", "false", "null", "Infinity", "NaN", "-Infinity"}
 _PUNCT = "{}[]:,"
+
+
+class _Raw(str):
+    """A raw JSON token (number/constant) captured verbatim from the source.
+
+    Distinct from a plain ``str`` value, which always represents a JSON
+    *string* and must be re-emitted quoted even when it looks numeric
+    (``"123"``) or boolean/null-like (``"true"``).
+    """
 
 
 class _Object(list):
@@ -45,6 +55,7 @@ class JsonPlugin:
     def analyze(self, source: str) -> AnalysisResult:
         diagnostics: list[Diagnostic] = []
         highlights, _keys = self._scan(source, diagnostics, line_offset=0)
+        highlights = tile_highlights(source, highlights)
         return self.rederive(source, highlights, extra_diagnostics=diagnostics)
 
     def tokenize_region(self, snippet: str, line_offset: int) -> list[Highlight] | None:
@@ -191,9 +202,9 @@ class JsonPlugin:
             return json.loads(
                 source,
                 object_pairs_hook=_Object,
-                parse_int=str,
-                parse_float=str,
-                parse_constant=str,
+                parse_int=_Raw,
+                parse_float=_Raw,
+                parse_constant=_Raw,
             )
         except json.JSONDecodeError as exc:
             diagnostics.append(
@@ -269,11 +280,12 @@ class JsonPlugin:
                 return "[]"
             items = [f"{child_pad}{self._render(v, depth + 1)}" for v in value]
             return "[\n" + ",\n".join(items) + "\n" + pad + "]"
+        if isinstance(value, _Raw):
+            # numbers / NaN / Infinity: keep the exact source spelling
+            return str(value)
         if isinstance(value, str):
-            # numbers/constants were captured raw by parse_int/parse_float;
-            # real strings are re-emitted in canonical escaped form
-            if value in _LITERALS or _NUMBER_RE.fullmatch(value):
-                return value
+            # a genuine JSON string: always quote it, even if its content
+            # looks like a number, boolean or null
             return json.dumps(value, ensure_ascii=False)
         if value is True:
             return "true"

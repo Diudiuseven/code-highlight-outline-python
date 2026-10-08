@@ -107,6 +107,22 @@ class CodeService:
                 ],
                 degraded=True,
             )
+        except Exception as exc:  # a plugin must never fail a whole request
+            return AnalysisResult(
+                language=language,
+                highlights=[],
+                outline=[],
+                formatted=text,
+                diagnostics=base_diagnostics
+                + [
+                    Diagnostic(
+                        code="analysis-error",
+                        message=f"{type(exc).__name__}: {exc}",
+                        severity=Severity.ERROR,
+                    )
+                ],
+                degraded=True,
+            )
         if base_diagnostics:
             result.diagnostics = base_diagnostics + result.diagnostics
             result.degraded = True
@@ -145,16 +161,22 @@ class CodeService:
             self._inflight[key] = task
             self.compute_count += 1
 
-            def _cleanup(_t: asyncio.Task, k: tuple[str, str] = key) -> None:
+            def _on_done(
+                t: asyncio.Task, k: tuple[str, str] = key
+            ) -> None:
                 self._inflight.pop(k, None)
+                # Cache exactly once, when the shared computation finishes.
+                # Degraded results (syntax errors, invalid encoding,
+                # timeouts, plugin failures) are never cached.
+                if not t.cancelled():
+                    res = t.result()
+                    if not res.degraded:
+                        self._cache_put(k, res)
 
-            task.add_done_callback(_cleanup)
+            task.add_done_callback(_on_done)
         # shield: one caller's cancellation must not cancel the shared
         # computation nor prevent others from receiving the result
-        result = await asyncio.shield(task)
-        if not any(d.code == "timeout" for d in result.diagnostics):
-            self._cache_put(key, result)
-        return result
+        return await asyncio.shield(task)
 
     async def apply_edit(
         self, language: str, old: bytes, edit: TextEdit, new: bytes
@@ -162,29 +184,18 @@ class CodeService:
         plugin = self._plugin(language)
         old_text, _ = _decode(old)
         new_text, new_diags = _decode(new)
-        affected = affected_range(old_text, edit, new_text)
+        fallback_affected = affected_range(old_text, edit, new_text)
 
         old_result = await self.analyze(language, old)
-        if new_diags:
-            result = await self.analyze(language, new)
-            return IncrementalResult(result=result, affected=affected)
 
-        loop = asyncio.get_running_loop()
-        try:
-            result, _used = await asyncio.wait_for(
-                loop.run_in_executor(
-                    None, analyze_edit, plugin, old_text, new_text,
-                    old_result, edit,
-                ),
-                timeout=self._config.timeout_seconds,
-            )
-        except asyncio.TimeoutError:
-            result = AnalysisResult(
+        async def _timeout_result() -> AnalysisResult:
+            return AnalysisResult(
                 language=language,
                 highlights=[],
                 outline=[],
                 formatted=new_text,
-                diagnostics=[
+                diagnostics=new_diags
+                + [
                     Diagnostic(
                         code="timeout",
                         message="analysis exceeded "
@@ -194,7 +205,31 @@ class CodeService:
                 ],
                 degraded=True,
             )
-            return IncrementalResult(result=result, affected=affected)
-        key = (language, hashlib.sha256(new).hexdigest())
-        self._cache_put(key, result)
+
+        loop = asyncio.get_running_loop()
+        try:
+            result, _used, inc_affected = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, analyze_edit, plugin, old_text, new_text,
+                    old_result, edit,
+                ),
+                timeout=self._config.timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            result = await _timeout_result()
+            # timeout results are never cached
+            return IncrementalResult(result=result, affected=fallback_affected)
+
+        affected = inc_affected if not result.degraded else fallback_affected
+        if new_diags:
+            # encode the invalid-encoding diagnostic without caching
+            result.diagnostics = new_diags + result.diagnostics
+            result.degraded = True
+            return IncrementalResult(result=result, affected=fallback_affected)
+
+        # Only clean results are content-addressed; degraded results
+        # (syntax errors, ...) must never pollute the cache.
+        if not result.degraded:
+            key = (language, hashlib.sha256(new).hexdigest())
+            self._cache_put(key, result)
         return IncrementalResult(result=result, affected=affected)

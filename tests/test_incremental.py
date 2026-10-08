@@ -23,7 +23,7 @@ def _apply_edit(text, edit):
 def _check(plugin, old, edit):
     new = _apply_edit(old, edit)
     old_result = plugin.analyze(old)
-    result, used = analyze_edit(plugin, old, new, old_result, edit)
+    result, used, affected = analyze_edit(plugin, old, new, old_result, edit)
     full = plugin.analyze(new)
     assert _sig(result) == _sig(full), "incremental result must equal full recompute"
     return "spliced" if used else "fallback"

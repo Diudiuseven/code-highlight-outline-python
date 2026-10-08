@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from typing import Callable
 
+from app.languages.tiling import tile_highlights
 from app.models import Highlight, Position, Range, TextEdit
 
 TokenizeRegion = Callable[[str, int], "list[Highlight] | None"]
@@ -44,18 +45,40 @@ def affected_range(old_text: str, edit: TextEdit, new_text: str) -> Range:
     )
 
 
+def full_range(text: str) -> Range:
+    """Range covering the whole text."""
+    if not text:
+        return Range(Position(0, 0), Position(0, 0))
+    lines = text.split("\n")
+    return Range(Position(0, 0), Position(len(lines) - 1, len(lines[-1])))
+
+
+def _clip_highlight(
+    text: str, h: Highlight, lo: int, hi: int
+) -> Highlight | None:
+    """Intersect a highlight with the byte range [lo, hi)."""
+    hs = offset_at(text, h.range.start)
+    he = offset_at(text, h.range.end)
+    a, b = max(hs, lo), min(he, hi)
+    if b <= a:
+        return None
+    return Highlight(
+        Range(position_at(text, a), position_at(text, b)), h.category
+    )
+
+
 def incremental_highlights(
     old_text: str,
     new_text: str,
     old_highlights: list[Highlight],
     edit: TextEdit,
     tokenize_region: TokenizeRegion,
-) -> list[Highlight] | None:
+) -> tuple[list[Highlight], Range] | None:
     """Splice highlights for an edited document.
 
-    Returns the new highlight list, or None when the edit cannot be handled
-    incrementally (boundary not in a clean lexer state, inconsistent
-    indentation, ...), in which case the caller must recompute fully.
+    Returns ``(new_highlights, affected)`` tiled over the whole new text, or
+    None when the edit cannot be handled incrementally (boundary not in a
+    clean lexer state, ...), in which case the caller must recompute fully.
     """
     old_lines = old_text.split("\n")
     new_lines = new_text.split("\n")
@@ -64,34 +87,73 @@ def incremental_highlights(
 
     start_line = edit.start.line
     end_line_old = edit.end.line  # old line index where replaced text ends
-    # expand the region to cover every old token intersecting the edit
-    edit_start = Position(edit.start.line, edit.start.col)
-    edit_end = Position(edit.end.line, edit.end.col)
-    for h in old_highlights:
-        if h.range.end <= edit_start or h.range.start >= edit_end:
-            continue
-        start_line = min(start_line, h.range.start.line)
-        end_line_old = max(end_line_old, h.range.end.line)
+
+    def _old_region_offsets(sl: int, el: int) -> tuple[int, int]:
+        start = offset_at(old_text, Position(sl, 0))
+        if el + 1 < len(old_lines):
+            end = offset_at(old_text, Position(el + 1, 0))
+        else:
+            end = len(old_text)
+        return start, end
+
+    # Expand the region to cover EVERY old token intersecting it. Expansion
+    # runs to a fixed point: widening the region can pull in further
+    # multi-line tokens (e.g. strings spanning several lines).
+    while True:
+        sl, el = start_line, end_line_old
+        region_start, region_end = _old_region_offsets(sl, el)
+        for h in old_highlights:
+            hs = offset_at(old_text, h.range.start)
+            he = offset_at(old_text, h.range.end)
+            # Strict intersection only: a token starting exactly at the
+            # region's first column, or ending exactly at its boundary,
+            # does not need to be re-tokenized.
+            if he <= region_start or hs >= region_end:
+                continue
+            start_line = min(start_line, h.range.start.line)
+            end_line_old = max(end_line_old, h.range.end.line)
+        if (sl, el) == (start_line, end_line_old):
+            break
 
     line_delta = len(new_lines) - len(old_lines)
     end_line_new = end_line_old + line_delta
-    if end_line_new >= len(new_lines):
+    if not (0 <= start_line <= end_line_new < len(new_lines)):
         return None
 
-    # prefix: old tokens ending at or before the region's first line
-    prefix = [
-        h
-        for h in old_highlights
-        if h.range.end.line < start_line
-        or (h.range.end.line == start_line and h.range.end.col == 0)
-    ]
-    # suffix: old tokens starting after the region's last old line
-    suffix = [h for h in old_highlights if h.range.start.line > end_line_old]
+    # Cut the old tiled token stream by ABSOLUTE OFFSETS. This is essential
+    # because filler ("text") tokens routinely span line boundaries; line-
+    # based cuts would otherwise duplicate or drop characters. Tokens
+    # crossing a cut point are clipped to it (and later re-tiled).
+    cut_start, cut_end = _old_region_offsets(start_line, end_line_old)
+    prefix_parts: list[Highlight] = []
+    suffix_parts: list[Highlight] = []
+    for h in old_highlights:
+        hs = offset_at(old_text, h.range.start)
+        he = offset_at(old_text, h.range.end)
+        if he <= cut_start:
+            prefix_parts.append(h)
+        elif hs >= cut_end:
+            suffix_parts.append(h)
+        else:
+            # intersects the region; keep whichever sides spill out so no
+            # character is lost when a token spans both cut points
+            left = _clip_highlight(old_text, h, 0, cut_start)
+            if left is not None:
+                prefix_parts.append(left)
+            right = _clip_highlight(old_text, h, cut_end, len(old_text))
+            if right is not None:
+                suffix_parts.append(right)
 
-    snippet = "\n".join(new_lines[start_line : end_line_new + 1])
-    if snippet and not snippet.endswith("\n"):
-        snippet += "\n"
-    region = tokenize_region(snippet, start_line)
+    snippet_lines = new_lines[start_line : end_line_new + 1]
+    snippet = "\n".join(snippet_lines)
+    # Lexers expect a trailing newline except when the region genuinely ends
+    # the document without one; fabricating one there would emit a phantom
+    # token past the end of the source.
+    needs_trailing_nl = (
+        end_line_new < len(new_lines) - 1
+    ) or new_text.endswith("\n")
+    token_input = snippet + ("\n" if needs_trailing_nl and not snippet.endswith("\n") else "")
+    region = tokenize_region(token_input, start_line)
     if region is None:
         return None
 
@@ -105,21 +167,29 @@ def incremental_highlights(
             ),
             h.category,
         )
-        for h in suffix
+        for h in suffix_parts
     ]
 
-    result = prefix + region + shifted_suffix
-    result.sort(key=lambda h: (h.range.start, h.range.end))
-    return result
+    combined = prefix_parts + region + shifted_suffix
+    combined.sort(key=lambda h: (h.range.start, h.range.end))
+    # Re-tile against the NEW text: clips any boundary artifact of the
+    # isolated tokenization and fills every gap, so the splice has the same
+    # full-coverage, non-overlapping property as a fresh analysis.
+    result = tile_highlights(new_text, combined)
+    affected = Range(
+        Position(start_line, 0),
+        Position(end_line_new, len(new_lines[end_line_new])),
+    )
+    return result, affected
 
 
 def analyze_edit(plugin, old_text: str, new_text: str, old_result, edit: TextEdit):
     """Incremental analysis with a guaranteed-consistent fallback.
 
-    Returns (AnalysisResult, used_incremental). The spliced result is only
-    trusted when the previous analysis was clean AND the new text parses
-    without syntax errors; otherwise a full recompute is returned, so the
-    output is always identical to a full recomputation.
+    Returns ``(AnalysisResult, used_incremental, affected)``. The spliced
+    result is only trusted when the previous analysis was clean AND the new
+    text parses without syntax errors; otherwise a full recompute is
+    returned, so the output is always identical to a full recomputation.
     """
     if not old_result.degraded:
         spliced = incremental_highlights(
@@ -130,7 +200,8 @@ def analyze_edit(plugin, old_text: str, new_text: str, old_result, edit: TextEdi
             plugin.tokenize_region,
         )
         if spliced is not None:
-            result = plugin.rederive(new_text, spliced)
+            new_highlights, affected = spliced
+            result = plugin.rederive(new_text, new_highlights)
             if not any(d.code == "syntax-error" for d in result.diagnostics):
-                return result, True
-    return plugin.analyze(new_text), False
+                return result, True, affected
+    return plugin.analyze(new_text), False, full_range(new_text)

@@ -11,6 +11,7 @@ import io
 import keyword
 import tokenize
 
+from app.languages.tiling import tile_highlights
 from app.models import (
     AnalysisResult,
     Diagnostic,
@@ -155,6 +156,9 @@ class PythonPlugin:
             ok = False
             diagnostics.append(_diag_from_exc(exc))
         highlights.sort(key=lambda h: (h.range.start, h.range.end))
+        # Fill every gap (whitespace, newlines, untokenized tails after a
+        # lexical error) so the ranges tile the whole source exactly once.
+        highlights = tile_highlights(source, highlights)
         return highlights, protected, ok
 
     @staticmethod
